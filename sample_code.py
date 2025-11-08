@@ -7,57 +7,103 @@ import datetime
 # --- 1. App Configuration ---
 
 # Set the page title and icon
-st.set_page_config(page_title="Mario Chatbot", page_icon="🍄")
-
-# Set the title of the chat interface
-st.title("Chat with Mario! 🍄")
-st.caption("Your personal plumber, powered by Ollama, ChromaDB, and Streamlit.")
+st.set_page_config(page_title="Dina & Dyno Chatbot", page_icon="🤖")
 
 # --- 2. Setup Ollama & ChromaDB ---
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "mario" # Your custom Ollama model
-CHROMA_PATH = "./mario_memory_db" # Folder to store long-term memory
+CHROMA_PATH = "./multi_persona_db" # One folder for all persona DBs
 
-# Function to initialize ChromaDB (cached for performance)
+# --- 3. Sidebar for Persona Selection & Controls ---
+
+st.sidebar.title("🤖 Persona Controls")
+st.sidebar.markdown("Choose who you want to talk to. Their chat history and memory are separate.")
+
+# Radio button for persona selection
+selected_persona = st.sidebar.radio(
+    "Choose a persona:",
+    ["Dina", "Dyno"],
+    key="selected_persona"
+)
+
+# Get the lowercase model name (assumes you have 'dina' and 'dyno' in Ollama)
+model_name = selected_persona.lower()
+
+# Get the unique, persona-specific collection name for ChromaDB
+collection_name = f"{model_name}_chat_history"
+
+# --- 4. ChromaDB Connection (Dynamic) ---
+
+# This function is cached, but it's called *once per collection*
+# Streamlit's cache is smart enough to store results for different inputs.
 @st.cache_resource
-def get_chroma_collection():
+def get_chroma_collection(collection_name):
     """
-    Initializes a persistent ChromaDB client and returns the chat history collection.
+    Initializes a persistent ChromaDB client for a SPECIFIC collection.
     """
     try:
         client = chromadb.PersistentClient(path=CHROMA_PATH)
-        collection = client.get_or_create_collection(name="chat_history")
-        print("ChromaDB client initialized successfully.")
-        return collection
+        collection = client.get_or_create_collection(name=collection_name)
+        print(f"ChromaDB client initialized for collection: {collection_name}")
+        return client, collection
     except Exception as e:
         st.error(f"Failed to initialize ChromaDB: {e}")
-        return None
+        return None, None
 
-# Load the ChromaDB collection
-collection = get_chroma_collection()
+# Get the client and the *correct* collection for the selected persona
+client, collection = get_chroma_collection(collection_name)
 
-# --- 3. Initialize Chat History in Session State ---
+# --- 5. Session State for Chat Histories ---
 
-# st.session_state is a dictionary that persists across script re-runs.
-# We use it to store the messages that are displayed on the screen.
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# We now create a *separate* message list for each persona
+if "dina_messages" not in st.session_state:
+    st.session_state.dina_messages = []
 
-# --- 4. Display Past Chat Messages ---
+if "dyno_messages" not in st.session_state:
+    st.session_state.dyno_messages = []
 
-# Loop through the stored messages and display them in the chat interface
-for message in st.session_state.messages:
+# Get the correct message list key (e.g., 'dina_messages' or 'dyno_messages')
+current_messages_key = f"{model_name}_messages"
+
+# --- 6. "Clear History" Button ---
+
+if st.sidebar.button(f"Clear {selected_persona}'s Memory"):
+    if client and collection:
+        try:
+            # Delete the collection from ChromaDB
+            client.delete_collection(name=collection_name)
+            
+            # Clear the displayed messages from session state
+            st.session_state[current_messages_key] = []
+            
+            # Re-create the collection so we can keep chatting
+            collection = client.get_or_create_collection(name=collection_name)
+            
+            st.sidebar.success(f"{selected_persona}'s memory cleared!")
+            # st.rerun() is needed to refresh the page immediately
+            st.rerun() 
+        except Exception as e:
+            st.sidebar.error(f"Error clearing memory: {e}")
+    else:
+        st.sidebar.error("ChromaDB not initialized.")
+
+
+# --- 7. Main Chat Interface ---
+
+st.title(f"Chat with {selected_persona}! 🤖")
+st.caption(f"This is a persistent chat. {selected_persona} will remember your conversation.")
+
+# Display past chat messages for the *selected* persona
+for message in st.session_state[current_messages_key]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# --- 5. Generator Function for Streaming Response ---
+# --- 8. Generator Function for Streaming (No Change Needed) ---
 
 def stream_response(payload):
     """
     Yields tokens from the Ollama API stream and returns the full response.
-    This function is used by st.write_stream.
     """
     full_response = ""
     try:
@@ -71,7 +117,6 @@ def stream_response(payload):
                 full_response += token
                 yield token # Yield each token for live streaming
                 
-                # Stop when the model signals it's done
                 if data.get('done'):
                     break
                     
@@ -80,74 +125,55 @@ def stream_response(payload):
     except Exception as e:
         yield f"Mamma mia! An error occurred: {e}"
     
-    # The 'st.write_stream' function will return this value
     return full_response
 
-# --- 6. Handle User Input and Run the Chat ---
+# --- 9. Handle User Input and Run the Chat ---
 
-# st.chat_input creates a text box at the bottom of the screen
-if prompt := st.chat_input("Ask Mario a question!"):
+if prompt := st.chat_input(f"Ask {selected_persona} a question!"):
     
-    # 1. Add user's message to session state (for display)
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # 1. Add user's message to the *correct* session state list
+    st.session_state[current_messages_key].append({"role": "user", "content": prompt})
     
     # 2. Display user's message in the chat
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # --- 3. RAG: Retrieve Relevant Memories from ChromaDB ---
+    # --- 3. RAG: Retrieve Memories (from the correct collection) ---
     
-    api_messages = [] # This list will be sent to the API
+    api_messages = [] 
     try:
-        # Query ChromaDB for the 5 most relevant past messages
-        results = collection.query(
-            query_texts=[prompt],
-            n_results=5
-        )
+        results = collection.query(query_texts=[prompt], n_results=5)
         
-        # Build the context for the API
         if results['documents']:
-            # Zip documents, metadatas together to sort them
-            zipped_results = list(zip(
-                results['documents'][0],
-                results['metadatas'][0]
-            ))
-            
-            # Sort by timestamp to keep the conversation in order
+            zipped_results = list(zip(results['documents'][0], results['metadatas'][0]))
             zipped_results.sort(key=lambda x: x[1].get('timestamp', 0))
-
-            # Add the sorted, retrieved memories to our API context
             for doc, meta in zipped_results:
                 api_messages.append({"role": meta['role'], "content": doc})
         
-        # Add the user's *current* prompt to the list
         api_messages.append({"role": "user", "content": prompt})
 
     except Exception as e:
         st.error(f"Error querying ChromaDB: {e}")
-        # Fallback: just send the current prompt without context
         api_messages = [{"role": "user", "content": prompt}]
         
-    # --- 4. RAG: Generate Response from Ollama ---
+    # --- 4. RAG: Generate Response (using the correct model) ---
 
-    # Define the payload for the Ollama API
     payload = {
-        "model": MODEL_NAME,
+        "model": model_name, # This is now dynamic!
         "messages": api_messages,
         "stream": True 
     }
 
-    # 5. Display the assistant's response (with streaming)
+    # 5. Display the assistant's response
     with st.chat_message("assistant"):
-        # st.write_stream streams the output of the generator function
         full_response = st.write_stream(stream_response(payload))
 
-    # --- 6. Save to Session State (for display) & ChromaDB (for memory) ---
+    # --- 6. Save to Session State & ChromaDB ---
 
-    # Add the assistant's full response to the session state (for display)
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    # Add response to the correct session state list (for display)
+    st.session_state[current_messages_key].append({"role": "assistant", "content": full_response})
     
-    # Save both the prompt and response to ChromaDB for long-term memory
+    # Save both prompt and response to the correct ChromaDB collection
     try:
         user_ts = datetime.datetime.now().isoformat()
         asst_ts = (datetime.datetime.now() + datetime.timedelta(seconds=1)).isoformat()
