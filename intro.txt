@@ -1,0 +1,1 @@
+We are Group 5, and we proudly present our AI models, Dyno and Dyna. Unlike cloud-based systems, our AIs run entirely on local hardware, giving us full control, faster performance, and stronger data privacy. Together, Dyno and Dyna demonstrate how smart, efficient, and independent AI can be when it’s built to think locally.
